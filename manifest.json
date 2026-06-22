@@ -1,8 +1,8 @@
 {
-  "name": "openclaw-memory-plugins",
+  "name": "memento-plugins",
   "version": "0.1.0",
   "description": "Hermes-inspired memory plugins for OpenClaw.",
-  "storage_root": "~/.openclaw-memory",
+  "storage_root": "~/.memento",
   "plugins": [
     {
       "id": "memory-store",

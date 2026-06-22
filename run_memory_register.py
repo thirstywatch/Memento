@@ -9,12 +9,12 @@ from openclaw_memory_plugins import MemoryStore, OpenClawMemoryGovernor
 def run_smoke_test() -> dict[str, object]:
     """Exercise the OpenClaw memory plugin's registration surface."""
 
-    with TemporaryDirectory(prefix="openclaw-memory-register-smoke-") as tmp_dir:
+    with TemporaryDirectory(prefix="memento-register-smoke-") as tmp_dir:
         with MemoryStore(tmp_dir) as store:
             governor = OpenClawMemoryGovernor(store=store, session_id="register-session")
             tools = governor.get_tool_schemas()
             provider = {
-                "provider_name": "openclaw-memory",
+                "provider_name": "memento",
                 "tool_names": [tool["name"] for tool in tools],
                 "contradict": json.loads(governor.handle_tool_call("memory_contradict", {"query": "openclaw memory", "limit": 3})),
                 "storage_root": str(store.root_dir),

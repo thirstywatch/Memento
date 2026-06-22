@@ -146,7 +146,7 @@ def run_runtime_smoke_test() -> dict[str, object]:
                     task_title="runtime smoke test",
                     result_summary="The runtime adapter wires prompt, tools, and turn hooks.",
                 )
-                assert attached["runtime"] == "openclaw-memory-runtime"
+                assert attached["runtime"] == "memento-runtime"
                 assert "memory_add" in attached["tool_names"]
                 assert bundle.system_prompt_block.startswith("# OpenClaw Memory Governor")
                 assert turn["memory_context"].startswith("<memory-context>")

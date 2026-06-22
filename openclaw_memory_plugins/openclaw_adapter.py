@@ -62,7 +62,7 @@ class OpenClawRuntimeAdapter:
 
     @property
     def name(self) -> str:
-        return "openclaw-memory-runtime"
+        return "memento-runtime"
 
     @property
     def governor(self) -> OpenClawMemoryGovernor:

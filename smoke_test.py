@@ -9,7 +9,7 @@ from openclaw_memory_plugins import MemoryReflector, MemoryRetriever, MemoryScor
 def run_smoke_test() -> dict[str, object]:
     """Run a small end-to-end check against an isolated temp store."""
 
-    with TemporaryDirectory(prefix="openclaw-memory-smoke-") as tmp_dir:
+    with TemporaryDirectory(prefix="memento-smoke-") as tmp_dir:
         with MemoryStore(tmp_dir) as store:
             workflow = MemoryWorkflow(
                 store=store,

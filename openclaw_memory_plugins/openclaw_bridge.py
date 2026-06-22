@@ -38,7 +38,7 @@ class OpenClawMemoryBridge:
         workspace_dir: str | Path | None = None,
         self_improving_dir: str | Path | None = None,
         proactivity_dir: str | Path | None = None,
-        bridge_filename: str = "openclaw-memory-bridge.md",
+        bridge_filename: str = "memento-bridge.md",
     ) -> None:
         self.openclaw_home = Path(openclaw_home).expanduser() if openclaw_home else None
         self.workspace_dir = Path(workspace_dir).expanduser() if workspace_dir else None

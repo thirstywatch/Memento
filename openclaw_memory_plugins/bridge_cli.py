@@ -186,7 +186,7 @@ def _run_command(command: str, payload: dict[str, Any]) -> Any:
             record = item.get("record", {}) if isinstance(item, dict) else {}
             matches.append(
                 {
-                    "corpus": "openclaw-memory",
+                    "corpus": "memento",
                     "path": f"memory/{record.get('id', '')}",
                     "title": record.get("content", "")[:80],
                     "kind": record.get("kind"),
@@ -214,7 +214,7 @@ def _run_command(command: str, payload: dict[str, Any]) -> Any:
         end = min(len(lines), start + line_count)
         content = "\n".join(lines[start:end])
         return {
-            "corpus": "openclaw-memory",
+            "corpus": "memento",
             "path": f"memory/{record.id}",
             "title": record.content[:80],
             "kind": record.kind,
@@ -222,7 +222,7 @@ def _run_command(command: str, payload: dict[str, Any]) -> Any:
             "fromLine": start + 1,
             "lineCount": end - start,
             "id": record.id,
-            "sourceType": "openclaw-memory",
+            "sourceType": "memento",
             "updatedAt": record.updated_at,
         }
     raise ValueError(f"Unknown bridge command: {command}")

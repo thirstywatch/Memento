@@ -9,7 +9,7 @@ from .memory_governor import OpenClawMemoryGovernor
 from .memory_store import MemoryStore
 from .openclaw_adapter import OpenClawRuntimeAdapter
 
-_DEFAULT_STORAGE_ROOT = Path("~/.openclaw-memory").expanduser()
+_DEFAULT_STORAGE_ROOT = Path("~/.memento").expanduser()
 _RUNTIME: OpenClawRuntimeAdapter | None = None
 
 

@@ -12,7 +12,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query", default="what do we know about this project?", help="Recall query to run first.")
     parser.add_argument("--assistant", default="Got it.", help="Assistant reply used for the sync turn.")
     parser.add_argument("--session-id", default="runtime-session", help="Optional session identifier.")
-    parser.add_argument("--root-dir", type=Path, help="Optional storage root; defaults to ~/.openclaw-memory.")
+    parser.add_argument("--root-dir", type=Path, help="Optional storage root; defaults to ~/.memento.")
     parser.add_argument("--workspace-dir", type=Path, help="Optional OpenClaw workspace directory.")
     parser.add_argument("--openclaw-home", type=Path, help="Optional OpenClaw home directory.")
     return parser

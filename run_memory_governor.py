@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--root-dir",
         type=Path,
-        help="Optional storage root; defaults to ~/.openclaw-memory.",
+        help="Optional storage root; defaults to ~/.memento.",
     )
     parser.add_argument("--session-id", default="", help="Optional session identifier for the governor.")
     return parser
