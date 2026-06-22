@@ -1,0 +1,43 @@
+{
+  "name": "openclaw-memory-plugins",
+  "version": "0.1.0",
+  "description": "Hermes-inspired memory plugins for OpenClaw.",
+  "storage_root": "~/.openclaw-memory",
+  "plugins": [
+    {
+      "id": "memory-store",
+      "module": "openclaw_memory_plugins.memory_store:MemoryStore",
+      "kind": "storage"
+    },
+    {
+      "id": "memory-retrieve",
+      "module": "openclaw_memory_plugins.memory_retrieve:MemoryRetriever",
+      "kind": "retrieval"
+    },
+    {
+      "id": "memory-score",
+      "module": "openclaw_memory_plugins.memory_score:MemoryScorer",
+      "kind": "gate"
+    },
+    {
+      "id": "memory-reflect",
+      "module": "openclaw_memory_plugins.memory_reflect:MemoryReflector",
+      "kind": "reflection"
+    },
+    {
+      "id": "memory-workflow",
+      "module": "openclaw_memory_plugins.memory_workflow:MemoryWorkflow",
+      "kind": "workflow"
+    },
+    {
+      "id": "memory-governor",
+      "module": "openclaw_memory_plugins.memory_governor:OpenClawMemoryGovernor",
+      "kind": "governor"
+    },
+    {
+      "id": "memory-register",
+      "module": "openclaw_memory_plugins.register:register",
+      "kind": "integration"
+    }
+  ]
+}
