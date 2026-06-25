@@ -9,7 +9,15 @@ from typing import Any, Iterable, Iterator
 
 from .memory_embeddings import EmbeddingBackend, cosine_similarity, pack_vector, unpack_vector
 from .memory_entities import EntityExtractor, EntityMention
-from .types import MemoryRecord, new_memory_id, utc_now_iso
+from .types import (
+    ADJUDICATION_RULES,
+    AGGRESSIVE_MERGE_KINDS,
+    CONSERVATIVE_KINDS,
+    ConflictRelation,
+    MemoryRecord,
+    new_memory_id,
+    utc_now_iso,
+)
 
 
 class MemoryStore:
@@ -252,6 +260,9 @@ class MemoryStore:
         except (TypeError, ValueError, json.JSONDecodeError):
             metadata = {}
         metadata.setdefault("trust", float(row["trust"]))
+        supersedes_ids = list(metadata.pop("supersedes_ids", []) or [])
+        contradicts_ids = list(metadata.pop("contradicts_ids", []) or [])
+        adjudication = str(metadata.pop("adjudication", "") or "")
         return MemoryRecord(
             id=str(row["id"]),
             domain=str(row["domain"]),
@@ -264,6 +275,9 @@ class MemoryStore:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             metadata=metadata,
+            supersedes_ids=supersedes_ids,
+            contradicts_ids=contradicts_ids,
+            adjudication=adjudication,
         )
 
     @staticmethod
@@ -298,6 +312,234 @@ class MemoryStore:
     def _rowid_for_id(self, record_id: str) -> int | None:
         row = self._conn.execute("SELECT rowid FROM memories WHERE id = ?", (record_id,)).fetchone()
         return int(row[0]) if row is not None else None
+
+    # ------------------------------------------------------------------
+    # Phase 1: 冲突检测与裁决
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _token_set(text: str) -> set[str]:
+        return {token.lower() for token in re.findall(r"[A-Za-z0-9_\-]+", text)}
+
+    @staticmethod
+    def _topic_tokens(text: str) -> set[str]:
+        """Extract content words used to compare replacement-style decisions."""
+        stopwords = {
+            "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can", "could",
+            "decided", "does", "do", "done", "for", "from", "had", "has", "have", "i", "if", "in",
+            "is", "it", "its", "just", "may", "might", "need", "needs", "not", "of", "on", "or",
+            "our", "out", "should", "so", "the", "then", "there", "this", "to", "use", "used", "using",
+            "we", "were", "will", "with", "would", "want", "wanted", "instead", "choose", "chose", "agreed",
+        }
+        tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9_\-]+", text)}
+        return {token for token in tokens if token not in stopwords and len(token) > 1}
+
+    @classmethod
+    def _claim_polarity(cls, text: str) -> str:
+        """判断一段文本的断言极性。"""
+        positive = re.compile(r"\b(?:prefer|like|love|use|want|need|always|must|should|enabled|true|can)\b", re.I)
+        negative = re.compile(r"\b(?:avoid|dislike|hate|never|cannot|can't|won't|disabled|false|shouldn't|mustn't|no|not)\b", re.I)
+        if positive.search(text):
+            return "positive"
+        if negative.search(text):
+            return "negative"
+        return "neutral"
+
+    @classmethod
+    def _content_similarity(cls, left: MemoryRecord, right: MemoryRecord) -> float:
+        left_tokens = cls._token_set(" ".join([left.content, " ".join(left.tags)]))
+        right_tokens = cls._token_set(" ".join([right.content, " ".join(right.tags)]))
+        if not left_tokens or not right_tokens:
+            return 0.0
+        shared = len(left_tokens & right_tokens)
+        union = len(left_tokens | right_tokens)
+        return shared / union if union else 0.0
+
+    def _load_entities_for(self, record: MemoryRecord) -> set[str]:
+        """加载一条记录的所有实体名。"""
+        names: set[str] = set()
+        for entity in self.get_record_entities(record.id):
+            normalized = str(entity.get("normalized") or "").strip().lower()
+            if normalized:
+                names.add(normalized)
+            name = str(entity.get("name") or "").strip().lower()
+            if name and name != normalized:
+                names.add(name)
+        if not names:
+            names.update(
+                str(item).strip().lower()
+                for item in self._entity_extractor.extract_normalized([record.content, " ".join(record.tags)])
+                if str(item).strip()
+            )
+        return names
+
+    def _match_adjudication_rule(self, candidate_kind: str, existing_kind: str) -> str | None:
+        """匹配适用的裁决原则名称，返回 None 表示无规则匹配。"""
+        for rule in ADJUDICATION_RULES:
+            left_ok = rule.left_kinds is None or candidate_kind in rule.left_kinds
+            right_ok = rule.right_kinds is None or existing_kind in rule.right_kinds
+            if left_ok and right_ok:
+                return rule.name
+        return None
+
+    def contradiction_check(
+        self,
+        candidate: MemoryRecord,
+        *,
+        domain: str | None = None,
+        threshold: float = 0.28,
+        limit: int = 5,
+    ) -> list[ConflictRelation]:
+        """在写入前检测候选记录与已有记录的冲突。
+
+        返回 ConflictRelation 列表，按冲突分数降序排列。
+        """
+        seed = candidate.content.strip()
+        if not seed:
+            return []
+
+        pool: list[MemoryRecord] = []
+        seen: set[str] = set()
+
+        def _append(records: list[MemoryRecord]) -> None:
+            for record in records:
+                if record.id in seen or record.id == candidate.id:
+                    continue
+                seen.add(record.id)
+                pool.append(record)
+
+        with self._lock:
+            _append(self.find_matching_records(seed, domain=domain, limit=limit * 4, status=None))
+            entity_names = self._entity_extractor.extract_names(seed)
+            if entity_names:
+                _append(self.find_records_for_entities(entity_names, domain=domain, limit=limit * 4, status=None))
+            if len(pool) < limit:
+                _append(self.list_records(domain=domain, status=None, limit=limit * 6))
+
+        results: list[ConflictRelation] = []
+        candidate_entities = self._load_entities_for(candidate)
+        candidate_topics = self._topic_tokens(candidate.content)
+
+        for existing in pool[:500]:
+            existing_entities = self._load_entities_for(existing)
+            existing_topics = self._topic_tokens(existing.content)
+            shared = candidate_entities & existing_entities
+            union = candidate_entities | existing_entities
+            topic_shared: set[str] = set()
+            topic_overlap = 0.0
+            if candidate.kind == existing.kind == "decision":
+                topic_shared = candidate_topics & existing_topics
+                topic_union = candidate_topics | existing_topics
+                if topic_union:
+                    topic_overlap = len(topic_shared) / len(topic_union)
+
+            if not shared and not (candidate.kind == existing.kind == "decision" and topic_overlap > 0.0):
+                continue
+
+            entity_overlap = len(shared) / len(union) if union else 0.0
+            effective_overlap = entity_overlap
+            if candidate.kind == existing.kind == "decision":
+                effective_overlap = max(entity_overlap, topic_overlap)
+
+            content_sim = self._content_similarity(candidate, existing)
+            polarity_c = self._claim_polarity(candidate.content)
+            polarity_e = self._claim_polarity(existing.content)
+
+            contradiction_score = effective_overlap * (1.0 - content_sim)
+            if candidate.kind == existing.kind == "decision" and topic_overlap > 0.0:
+                contradiction_score = max(contradiction_score, 0.35 + (topic_overlap * 0.25))
+            if polarity_c != "neutral" and polarity_e != "neutral" and polarity_c != polarity_e:
+                contradiction_score += 0.18
+            if (
+                candidate.kind != existing.kind
+                and {candidate.kind, existing.kind} & {"decision", "preference", "fact", "failure"}
+            ):
+                contradiction_score += 0.05
+
+            if effective_overlap < 0.25 and not (candidate.kind == existing.kind == "decision" and topic_overlap > 0.0):
+                continue
+
+            if contradiction_score < threshold and not (candidate.kind == existing.kind == "decision" and topic_overlap > 0.0):
+                continue
+
+            rule_name = self._match_adjudication_rule(candidate.kind, existing.kind) or ""
+            suggested = self._adjudicate_action(candidate, existing, rule_name, contradiction_score)
+
+            results.append(ConflictRelation(
+                candidate_id=candidate.id,
+                existing_id=existing.id,
+                score=min(1.0, contradiction_score),
+                entity_overlap=effective_overlap,
+                content_similarity=content_sim,
+                polarity_left=polarity_c,
+                polarity_right=polarity_e,
+                shared_entities=sorted(shared or topic_shared),
+                rule_applied=rule_name,
+                suggested_action=suggested,
+            ))
+
+        results.sort(key=lambda r: (r.score, r.entity_overlap), reverse=True)
+        return results[:limit]
+
+    def _adjudicate_action(
+        self,
+        candidate: MemoryRecord,
+        existing: MemoryRecord,
+        rule_name: str,
+        score: float,
+    ) -> str:
+        """根据裁决原则和信任/置信度决定写入动作: write/stage/supersede/reject。
+
+        优先级:
+          1. 匹配到的 AdjudicationRule
+          2. 分数+信任组合: 高冲突+低信任旧记录 → supersede
+          3. 默认保守: stage
+        """
+        # 检查是否有 explicit 裁决规则匹配
+        for rule in ADJUDICATION_RULES:
+            if rule.name == rule_name:
+                if rule.recommended_action == "supersede":
+                    return "supersede"
+                if rule.recommended_action == "stage":
+                    return "stage"
+                return rule.recommended_action
+
+        # 基于信任和置信度判断
+        existing_trust = float(existing.metadata.get("trust", 0.5)) if isinstance(existing.metadata, dict) else 0.5
+        candidate_is_preferred = candidate.confidence >= 0.75 and existing.confidence < 0.6
+        existing_is_stale = existing_trust < 0.3
+
+        if score >= 0.4 and candidate.kind == "decision" and existing.kind == "fact":
+            return "supersede"
+        if score >= 0.4 and candidate.kind == "fact" and existing.kind == "decision":
+            return "stage"
+        if score >= 0.4 and candidate.kind == "preference" and existing.kind == "fact":
+            return "supersede"
+        if score >= 0.4 and candidate.kind == "fact" and existing.kind == "preference":
+            return "stage"
+
+        if score >= 0.6 and (candidate_is_preferred or existing_is_stale):
+            return "supersede"
+        if score >= 0.4 and candidate.kind in CONSERVATIVE_KINDS and existing.kind in CONSERVATIVE_KINDS:
+            return "stage"
+        if score >= 0.5 and candidate.confidence < 0.4:
+            return "reject"
+        return "write"
+
+    def supersede_record(self, old_id: str, new_id: str, *, adjudication: str = "") -> MemoryRecord | None:
+        """将旧记录标记为 superseded，记录被谁覆盖。"""
+        with self._lock:
+            existing = self.find_record(old_id)
+            if existing is None:
+                return None
+            existing.status = "superseded"
+            existing.touch()
+            metadata = dict(existing.metadata)
+            metadata["superseded_by"] = new_id
+            if adjudication:
+                metadata["adjudication"] = adjudication
+            existing.metadata = metadata
+            return self.upsert_record(existing, _skip_contradiction=True)
 
     def _upsert_entity(self, mention: EntityMention) -> tuple[str, str]:
         now = utc_now_iso()
@@ -521,14 +763,67 @@ class MemoryStore:
     def save_record(self, record: MemoryRecord | dict[str, Any] | str) -> MemoryRecord:
         return self.upsert_record(record)
 
-    def upsert_record(self, record: MemoryRecord | dict[str, Any] | str) -> MemoryRecord:
+    def upsert_record(
+        self,
+        record: MemoryRecord | dict[str, Any] | str,
+        *,
+        _skip_contradiction: bool = False,
+    ) -> MemoryRecord:
         item = self._coerce_record(record)
+        if not item.id:
+            item.id = new_memory_id()
+
+        # ── Phase 1: 摄入前冲突检测 ──────────────────────────────────
+        contradictions: list[ConflictRelation] = []
+        if not _skip_contradiction and item.status not in ("superseded", "removed", "disputed"):
+            contradictions = self.contradiction_check(item, domain=item.domain, limit=3)
+            # 找到最严重的冲突裁决
+            if contradictions:
+                top = contradictions[0]
+                if top.suggested_action == "reject":
+                    # reject: 不写入，直接返回候选（标记 metadata 说明原因）
+                    item.metadata = dict(item.metadata)
+                    item.metadata["rejected"] = True
+                    item.metadata["rejection_reason"] = f"conflict with {top.existing_id} (score={top.score:.2f})"
+                    self._append_jsonl(self.records_path, {
+                        "action": "reject", "record": item.to_dict(), "conflict": top.to_dict(),
+                    })
+                    return item
+
+                if top.suggested_action == "supersede":
+                    # supersede: 先标记冲突的旧记录，再写入新记录
+                    for conflict in contradictions:
+                        if conflict.suggested_action == "supersede":
+                            self.supersede_record(
+                                conflict.existing_id, item.id,
+                                adjudication=f"superseded by {item.kind} '{item.content[:60]}' "
+                                             f"(conflict_score={conflict.score:.2f})",
+                            )
+                            item.supersedes_ids = list(item.supersedes_ids) + [conflict.existing_id]
+
+                if top.suggested_action == "stage":
+                    item.status = "staged"
+
+                # 记录所有冲突 ID
+                item.contradicts_ids = list(set(
+                    list(item.contradicts_ids) + [c.existing_id for c in contradictions
+                                                  if c.suggested_action != "supersede"]
+                ))
+
+        # 确保冲突关系字段同步到 metadata（持久化到 SQLite）
+        item.metadata = dict(item.metadata)
+        if item.supersedes_ids:
+            item.metadata["supersedes_ids"] = list(item.supersedes_ids)
+        if item.contradicts_ids:
+            item.metadata["contradicts_ids"] = list(item.contradicts_ids)
+        if item.adjudication:
+            item.metadata["adjudication"] = item.adjudication
+
+        # ── 正常写入 ──────────────────────────────────────────────────
         with self._lock:
             existing = self.find_record(item.id)
             if existing is not None:
                 item.created_at = existing.created_at
-            if not item.id:
-                item.id = new_memory_id()
             if not item.created_at:
                 item.created_at = utc_now_iso()
             item.touch()
@@ -576,7 +871,11 @@ class MemoryStore:
             self._sync_embedding(item)
             self._conn.commit()
             stored = self.find_record(item.id) or item
-            self._append_jsonl(self.records_path, {"action": "save", "record": stored.to_dict()})
+            action = "reject" if contradictions and contradictions[0].suggested_action == "reject" else "save"
+            entry: dict[str, Any] = {"action": action, "record": stored.to_dict()}
+            if contradictions:
+                entry["contradictions"] = [c.to_dict() for c in contradictions]
+            self._append_jsonl(self.records_path, entry)
             return stored
 
     def stage_record(self, record: MemoryRecord | dict[str, Any] | str, *, reason: str = "score gate", score: float | None = None) -> MemoryRecord:

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from .memory_reflect import MemoryReflector, ReflectionBundle
+from .memory_reflect import CorrectionTarget, MemoryReflector, ReflectionBundle
 from .memory_retrieve import MemoryRetriever, RetrievedMemory
 from .memory_score import MemoryScorer, ScoreDecision
 from .memory_store import MemoryStore
@@ -64,17 +64,22 @@ class ReflectionOutcome:
     reflection_saved: MemoryRecord
     skill_saved: MemoryRecord | None = None
     skill_outcome: IngestOutcome | None = None
+    correction_results: list[dict[str, Any]] = field(default_factory=list)  # ── Phase 3 ──
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "bundle": {
                 "summary": self.bundle.summary.to_dict(),
                 "skill_candidate": self.bundle.skill_candidate.to_dict() if self.bundle.skill_candidate else None,
+                "correction_targets": [t.to_dict() for t in self.bundle.correction_targets],
             },
             "reflection_saved": self.reflection_saved.to_dict(),
             "skill_saved": self.skill_saved.to_dict() if self.skill_saved else None,
             "skill_outcome": self.skill_outcome.to_dict() if self.skill_outcome else None,
         }
+        if self.correction_results:
+            d["correction_results"] = list(self.correction_results)
+        return d
 
 
 class MemoryWorkflow:
@@ -248,6 +253,8 @@ class MemoryWorkflow:
         skill_steps: list[str] | None = None,
         domain: MemoryDomain = "project",
         ingest_skill_candidate: bool = True,
+        correction_targets: list[CorrectionTarget] | None = None,  # ── Phase 3 ──
+        corrects_ids: list[str] | None = None,  # ── Phase 3 ──
     ) -> ReflectionOutcome:
         bundle = self.reflector.bundle(
             task_title=task_title,
@@ -255,10 +262,50 @@ class MemoryWorkflow:
             lessons=lessons,
             skill_steps=skill_steps,
             domain=domain,
+            correction_targets=correction_targets,
+            corrects_ids=corrects_ids,
         )
         reflection_saved = self.store.save_reflection(bundle.summary)
         skill_saved = None
         skill_outcome = None
+
+        # ── Phase 3: 执行修正 ──
+        correction_results: list[dict[str, Any]] = []
+        for target in bundle.correction_targets:
+            if target.action == "supersede":
+                self.store.supersede_record(
+                    target.record_id, reflection_saved.id,
+                    adjudication=target.reason or "superseded by reflection",
+                )
+                correction_results.append({
+                    "record_id": target.record_id, "action": "supersede", "by": reflection_saved.id,
+                })
+            elif target.action == "dispute":
+                rec = self.store.find_record(target.record_id)
+                if rec:
+                    rec.status = "disputed"
+                    rec.touch()
+                    meta = dict(rec.metadata)
+                    meta["disputed_by_reflection"] = reflection_saved.id
+                    meta["dispute_reason"] = target.reason
+                    rec.metadata = meta
+                    self.store.upsert_record(rec, _skip_contradiction=True)
+                    correction_results.append({
+                        "record_id": target.record_id, "action": "dispute",
+                    })
+            elif target.action == "decay":
+                rec = self.store.find_record(target.record_id)
+                if rec and target.confidence > 0:
+                    meta = dict(rec.metadata)
+                    meta["trust"] = max(0.1, float(meta.get("trust", 0.5)) - 0.2)
+                    rec.metadata = meta
+                    rec.touch()
+                    self.store.upsert_record(rec, _skip_contradiction=True)
+                    correction_results.append({
+                        "record_id": target.record_id, "action": "decay",
+                        "new_trust": meta["trust"],
+                    })
+
         if bundle.skill_candidate and ingest_skill_candidate:
             skill_outcome = self.ingest(
                 bundle.skill_candidate,
@@ -277,6 +324,7 @@ class MemoryWorkflow:
             reflection_saved=reflection_saved,
             skill_saved=skill_saved,
             skill_outcome=skill_outcome,
+            correction_results=correction_results,
         )
 
     def run_cycle(

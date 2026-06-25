@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 from .memory_store import MemoryStore
-from .types import MemoryRecord
+from .types import MemoryRecord, MemoryStatus
 
 _WORD_RE = re.compile(r"[A-Za-z0-9_\-]+")
 
@@ -18,12 +18,25 @@ class RetrievedMemory:
     score: float
     reasons: list[str]
 
+    # ── Phase 2: 冲突感知字段 ──
+    contradicts: list[dict[str, Any]] = field(default_factory=list)
+    superseded_by: str = ""
+    status_snapshot: str = "active"
+    trust_snapshot: float = 0.5
+
     def to_dict(self) -> dict:
-        return {
+        d: dict[str, Any] = {
             "score": round(self.score, 3),
             "reasons": list(self.reasons),
             "record": self.record.to_dict(),
+            "status": self.status_snapshot,
+            "trust": round(self.trust_snapshot, 3),
         }
+        if self.contradicts:
+            d["contradicts"] = list(self.contradicts)
+        if self.superseded_by:
+            d["superseded_by"] = self.superseded_by
+        return d
 
 
 class MemoryRetriever:
@@ -81,6 +94,7 @@ class MemoryRetriever:
             reasons.append(f"confidence bonus: {confidence_bonus:.2f}")
 
         trust = self._trust_value(record)
+        trust_snapshot = trust
         trust_bonus = (trust - 0.5) * 0.3
         score += trust_bonus
         if trust_bonus:
@@ -102,12 +116,59 @@ class MemoryRetriever:
         if decay_reason:
             reasons.append(decay_reason)
 
-        if record.status != "active":
+        # ── Phase 2: 状态感知降权 ──
+        status_snapshot: MemoryStatus = record.status
+        if record.status == "superseded":
+            score *= 0.2
+            reasons.append("superseded penalty (0.2x)")
+        elif record.status == "disputed":
+            score *= 0.4
+            reasons.append("disputed penalty (0.4x)")
+        elif record.status == "removed":
+            score *= 0.1
+            reasons.append("removed penalty (0.1x)")
+        elif record.status == "staged":
+            score *= 0.7
+            reasons.append("staged penalty (0.7x)")
+        elif record.status != "active":
             score *= 0.5
             reasons.append("inactive penalty")
 
+        # ── Phase 2: 加载冲突关系 ──
+        contradicts_data: list[dict[str, Any]] = []
+        superseded_by = ""
+        if record.contradicts_ids:
+            for cid in record.contradicts_ids:
+                c_record = self.store.find_record(cid)
+                if c_record:
+                    contradicts_data.append({
+                        "record_id": cid,
+                        "status": c_record.status,
+                        "content": c_record.content[:80],
+                    })
+        if record.supersedes_ids:
+            for sid in record.supersedes_ids:
+                s_record = self.store.find_record(sid)
+                if s_record:
+                    contradicts_data.append({
+                        "record_id": sid,
+                        "status": s_record.status,
+                        "superseded": True,
+                        "content": s_record.content[:80],
+                    })
+        if record.status == "superseded" and record.metadata:
+            superseded_by = str(record.metadata.get("superseded_by", "") or "")
+
         score = max(0.0, min(score, 1.0))
-        return RetrievedMemory(record=record, score=score, reasons=reasons)
+        return RetrievedMemory(
+            record=record,
+            score=score,
+            reasons=reasons,
+            contradicts=contradicts_data,
+            superseded_by=superseded_by,
+            status_snapshot=status_snapshot,
+            trust_snapshot=trust_snapshot,
+        )
 
     def _candidate_pool(self, query: str, *, domain: str | None = None, limit: int = 5) -> tuple[list[MemoryRecord], list[tuple[MemoryRecord, float]]]:
         fragment_hits = self.store.find_matching_records(query, domain=domain, limit=max(limit * 3, 8), status=None)
@@ -160,9 +221,34 @@ class MemoryRetriever:
         lines: list[str] = []
         for item in matches:
             record = item.record
-            lines.append(f"- [{record.domain}/{record.kind}] {record.content}")
-            if len(lines) >= limit:
+            prefix = "[active]"
+            if item.status_snapshot == "superseded":
+                prefix = "[superseded]"
+            elif item.status_snapshot == "disputed":
+                prefix = "[disputed]"
+            elif item.status_snapshot == "staged":
+                prefix = "[staged]"
+            elif item.status_snapshot == "removed":
+                continue  # 不展示已删除的
+            lines.append(f"- {prefix} [{record.domain}/{record.kind}] {record.content}")
+
+            # ── Phase 2: 冲突语义 ──
+            if item.contradicts:
+                for cx in item.contradicts[:2]:
+                    cx_status = cx.get("status", "")
+                    if cx.get("superseded"):
+                        lines.append(f"  [已覆盖] 旧记录 {cx['record_id'][:8]} ({cx_status})")
+                    else:
+                        lines.append(f"  [冲突] 与 {cx['record_id'][:8]} ({cx_status}) 存在冲突 — {cx.get('content','')[:50]}")
+            if item.superseded_by:
+                lines.append(f"  [已被覆盖] 此记录已被 {item.superseded_by[:8]} 替代")
+
+            if len(lines) >= limit * 3:
                 break
+
+        if not lines:
+            return ""
+
         pack = "\n".join(lines)
         if len(pack) > max_chars:
             return pack[: max_chars - 3] + "..."
